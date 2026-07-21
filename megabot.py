@@ -5,17 +5,24 @@ import shlex
 import asyncio
 import logging
 import math
+import urllib.request
+import urllib.parse
+import json
+import shutil
 from requestlistener import RequestListener
 from transferlistener import TransferListener
 from mega import (MegaApi, MegaNode, MegaTransfer)
 
 BOT_TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
+SIZE_NAME = ("B", "KB", "MB", "GB", "TB", "PB")
+
 logging.basicConfig(level=logging.INFO,
                     # filename='runner.log',
                     format='%(levelname)s\t%(asctime)s %(message)s')
 
 
+            
 class MegaSession():
 
     def __init__(self, api, listener):
@@ -23,8 +30,8 @@ class MegaSession():
         self._listener = listener
         self.backlog = []
         self.current_dls = []
-
-    def ls(self, path, files, depth):
+        os.umask(0o0002)
+    def ls(self, path, files, depth=0):
 
         if path == None:
             return 'INFO: Not logged in'
@@ -69,12 +76,19 @@ class MegaSession():
         if self._listener.cwd == None:
             logging.info('Not logged in')
             return
+
         transfer_listener = TransferListener()
+        #auto_import_radarr(save_to+'/'+node.getName(),'/downloads/films')
+        
         # node = self._api.authorizeNode(node)
         if node == None:
             logging.error('Node not found')
             return
         # , MegaTransfer.COLLISION_CHECK_FINGERPRINT, MegaTransfer.COLLISION_RESOLUTION_NEW_WITH_N)
+        # pass it through the configuration API handler.
+        logging.info("--- AVAILABLE METHODS ---")
+        logging.info([attr for attr in dir(self._api) if "connection" in attr.lower() or "thread" in attr.lower() or "download" in attr.lower()])
+        self._api.setMaxConnections(6)
         self.current_dls.append(transfer_listener)
         self._api.startDownload(
             node, save_to+'/'+node.getName(), transfer_listener)
@@ -97,14 +111,14 @@ class MegaSession():
         logging.info('Bye!')
         return True
 
+
 def convert_size(size_bytes):
     if size_bytes == 0:
         return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB", "PB")
     i = int(math.floor(math.log(size_bytes, 1024)))
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
-    return "%s %s" % (s, size_name[i])
+    return "%s %s" % (s, SIZE_NAME[i])
 
 def expand_ranges(msg):
     output = set()
@@ -115,7 +129,7 @@ def expand_ranges(msg):
         else:
             output.add(int(item))
     return output
-
+                   
 class MegaBot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -139,10 +153,10 @@ class MegaBot(commands.Cog):
         period = 1
         while True:
             if any([dl.over_quota for dl in self.mega.current_dls]):
+                period = min(2*period,256)
                 await status_message.edit(content=self.status_text()+f'Retrying connection in {period} s')
-                period  = 2 ** period
                 await asyncio.sleep(period)
-                continue  
+                continue
             if any([not dl.is_finished for dl in self.mega.current_dls]):
                 await status_message.edit(content=self.status_text())
                 await asyncio.sleep(1)  # Update every second
@@ -179,32 +193,41 @@ class MegaBot(commands.Cog):
 
     @commands.command()
     async def ping(self, ctx):
-        await ctx.send("pong")
+        """
+        Check the availability of the bot
+        """
+        await ctx.send(f"Pong!      Latency:  {round(self.bot.latency * 1000)}ms")
 
     @commands.command()
-    async def dl(self, ctx, cat, link, *, flags: str = ''):
-        match cat:
-            case 'f':
-                dir = '/downloads'
-            case 's':
-                dir = '/downloads'
-            case _:
-                await ctx.send("Category doesn't exist")
-                return
+    async def dl(self, ctx,
+                 link=commands.parameter(
+                     default=None, description="Mega link"), *,
+                 flags: str = commands.parameter(default='', description="Optional flags: -dir, -f, -s")):
+        """
+        Download file or files from Mega.nz 
+        Flags:
+            -dir: Add cutstom directory,
+            -f: Download to \\films\\dir,
+            -s: Download to \\shows\\dir
+        """
+        if not link:  # or not link.startswith('https://mega.nz/'):
+            await ctx.send('❌ Invalid Mega Link')
+            return
         try:
             split_flags = shlex.split(flags)
         except:
             await ctx.send("Command is not correct")
             return
-        if '--sub' in split_flags:
-            await ctx.send("Select the directory")
-        if '--dir' in split_flags:
-            try:
-                dir += '/'+split_flags[split_flags.index('--dir')+1].strip()
-                os.makedirs(dir, exist_ok=True)
-            except:
-                await ctx.send("Not a correct directory")
-                return
+        if '-f' in split_flags:
+            dir = '/downloads/films.tmp'
+        elif '-s' in split_flags:
+            dir = '/downloads/shows.tmp'
+        else:
+            dir = '/downloads'
+        olddir = dir
+        if '-dir' in split_flags:
+            dir += '/'+split_flags[split_flags.index('-dir')+1].strip()
+
         api = MegaApi(API_KEY, None, None, 'megabot session')
         listener = RequestListener()
         self.mega = MegaSession(api,  listener)
@@ -219,49 +242,77 @@ class MegaBot(commands.Cog):
             await ctx.send(f"Opened  folder `{self.mega.pwd()}`")
             try:
                 files = []
-                self.mega.ls(self.mega._listener.cwd, files, 0)
-                output = '```ansi'+os.linesep + \
-                    os.linesep.join(str(i)+n["name"]
-                                    for i, n in enumerate(files)) + '```'
-                await ctx.send(output)
-                await ctx.send('Choose files to download')
+                self.mega.ls(self.mega._listener.cwd, files)
             except:
                 await ctx.send("Couldn't open `" + link + '`')
                 self.mega = None
                 return
-            self.mega._api.authorizeNode(self.mega._listener.cwd)
-            try:
-                def check(
-                    m): return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
-                msg = await bot.wait_for('message', timeout=60.0, check=check)
-                # self.mega._api.authorizeNode(self.mega._listener.cwd)
-            except asyncio.TimeoutError:
-                await ctx.send('You took too long to respond! Please try again.')
-                return
             
+            self.mega._api.authorizeNode(self.mega._listener.cwd)
+            
+            while True:
+                filelist = '```ansi'+os.linesep + \
+                    os.linesep.join(str(i)+n["name"]
+                                    for i, n in enumerate(files)) + '```'
+                await ctx.send(filelist)
+                await ctx.send(f'Choose files to download in `{dir}`')
+                try:
+                    def check(
+                        m): return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+                    msg = await bot.wait_for('message', timeout=60.0, check=check)
+                    # self.mega._api.authorizeNode(self.mega._listener.cwd)
+                except asyncio.TimeoutError:
+                    await ctx.send('You took too long to respond! Please try again.')
+                    return
+                if msg.content.startswith("-dir"):
+                        dir = olddir + '/' + shlex.split(msg.content)[1]
+                        continue
+                 
+                try:
+                    os.makedirs(dir, exist_ok=True)
+                    break
+                except:
+                    await ctx.send(f"`{dir}` is not a correct directory")
+                    return
+
             for n in expand_ranges(msg.content):
                 node = self.mega._api.getNodeByHandle(files[n]["handle"])
                 node = self.mega._api.authorizeNode(node)
+
                 self.mega.download(node, dir)
                 # If this is the first download, start the status updates
                 if len(self.mega.current_dls) == 1:
                     asyncio.create_task(self.status_message_task(ctx))
         else:
+
             files = []
-            self.mega.ls(self.mega._listener.cwd, files, 0)
-            question = await ctx.send("Found file:\n```ansi\n " + files[0]["name"] + "``` Do you want to download?")
+            self.mega.ls(self.mega._listener.cwd, files)
+
+            if len(files) < 1:
+                await ctx.send('❌ Error: No files found')
+
+            question = await ctx.send("Found file:\n```ansi\n " + files[0]["name"] +
+                                      f"``` Do you want to download in `{dir}` ?")
             await question.add_reaction('✅')
             await question.add_reaction('❌')
+
             def check(reaction, user): return reaction.message.id == question.id and user == ctx.message.author and str(
                 reaction.emoji) in ['✅', '❌']
             try:
                 reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
                 match str(reaction.emoji):
+
                     case '✅':
+                        try:
+                            os.makedirs(dir, exist_ok=True)
+                        except:
+                            await ctx.send(f"`{dir}` is not a correct directory")
+                            return
                         self.mega.download(self.mega._listener.cwd, dir)
                         # If this is the first download, start the status updates
                         if len(self.mega.current_dls) == 1:
                             asyncio.create_task(self.status_message_task(ctx))
+
                     case _:
                         await self.cancel(ctx)
             except asyncio.TimeoutError:
@@ -273,9 +324,13 @@ class MegaBot(commands.Cog):
 
     @commands.command()
     async def ls(self, ctx):
+        """
+        List all files in current session
+        """
+
         if self.mega != None:
             files = []
-            self.mega.ls(self.mega._listener.cwd, files, 0)
+            self.mega.ls(self.mega._listener.cwd, files)
             output = '```ansi'+os.linesep + \
                 os.linesep.join(str(i)+' '+n["name"]
                                 for i, n in enumerate(files)) + '```'
@@ -283,9 +338,12 @@ class MegaBot(commands.Cog):
         else:
             await ctx.send("Start a session")
             return
-
+    
     @commands.command()
     async def cancel(self, ctx):
+        """
+        Cancel and close current session
+        """
         if self.mega:
             self.mega._api.cancelTransfers(MegaTransfer.TYPE_DOWNLOAD)
             await ctx.send(f"Cancelling the download of `{self.mega.pwd()}`")
@@ -295,7 +353,9 @@ class MegaBot(commands.Cog):
         else:
             await ctx.send("No session open")
 
+
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
 
 @bot.event
 async def on_ready():
