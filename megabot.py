@@ -11,6 +11,7 @@ import json
 import shutil
 from requestlistener import RequestListener
 from transferlistener import TransferListener
+from radarrlistener import RadarrManager
 from mega import (MegaApi, MegaNode, MegaTransfer)
 
 BOT_TOKEN = os.getenv("TOKEN")
@@ -22,7 +23,6 @@ logging.basicConfig(level=logging.INFO,
                     format='%(levelname)s\t%(asctime)s %(message)s')
 
 
-            
 class MegaSession():
 
     def __init__(self, api, listener):
@@ -30,7 +30,7 @@ class MegaSession():
         self._listener = listener
         self.backlog = []
         self.current_dls = []
-        os.umask(0o0002)
+
     def ls(self, path, files, depth=0):
 
         if path == None:
@@ -70,24 +70,20 @@ class MegaSession():
             return
         self._listener.cwd = node
 
-    def download(self, node, save_to):
+    def download(self, node, save_to, radarr_api=None):
         """Usage: get remotefile"""
 
         if self._listener.cwd == None:
             logging.info('Not logged in')
             return
 
-        transfer_listener = TransferListener()
-        #auto_import_radarr(save_to+'/'+node.getName(),'/downloads/films')
-        
+        transfer_listener = TransferListener(radarr_api)
+
         # node = self._api.authorizeNode(node)
         if node == None:
             logging.error('Node not found')
             return
-        # , MegaTransfer.COLLISION_CHECK_FINGERPRINT, MegaTransfer.COLLISION_RESOLUTION_NEW_WITH_N)
-        # pass it through the configuration API handler.
-        logging.info("--- AVAILABLE METHODS ---")
-        logging.info([attr for attr in dir(self._api) if "connection" in attr.lower() or "thread" in attr.lower() or "download" in attr.lower()])
+
         self._api.setMaxConnections(6)
         self.current_dls.append(transfer_listener)
         self._api.startDownload(
@@ -120,6 +116,7 @@ def convert_size(size_bytes):
     s = round(size_bytes / p, 2)
     return "%s %s" % (s, SIZE_NAME[i])
 
+
 def expand_ranges(msg):
     output = set()
     for item in msg.split(','):
@@ -129,7 +126,8 @@ def expand_ranges(msg):
         else:
             output.add(int(item))
     return output
-                   
+
+
 class MegaBot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -153,7 +151,7 @@ class MegaBot(commands.Cog):
         period = 1
         while True:
             if any([dl.over_quota for dl in self.mega.current_dls]):
-                period = min(2*period,256)
+                period = min(2*period, 256)
                 await status_message.edit(content=self.status_text()+f'Retrying connection in {period} s')
                 await asyncio.sleep(period)
                 continue
@@ -247,9 +245,9 @@ class MegaBot(commands.Cog):
                 await ctx.send("Couldn't open `" + link + '`')
                 self.mega = None
                 return
-            
+
             self.mega._api.authorizeNode(self.mega._listener.cwd)
-            
+
             while True:
                 filelist = '```ansi'+os.linesep + \
                     os.linesep.join(str(i)+n["name"]
@@ -265,9 +263,9 @@ class MegaBot(commands.Cog):
                     await ctx.send('You took too long to respond! Please try again.')
                     return
                 if msg.content.startswith("-dir"):
-                        dir = olddir + '/' + shlex.split(msg.content)[1]
-                        continue
-                 
+                    dir = olddir + '/' + shlex.split(msg.content)[1]
+                    continue
+
                 try:
                     os.makedirs(dir, exist_ok=True)
                     break
@@ -278,8 +276,9 @@ class MegaBot(commands.Cog):
             for n in expand_ranges(msg.content):
                 node = self.mega._api.getNodeByHandle(files[n]["handle"])
                 node = self.mega._api.authorizeNode(node)
-
-                self.mega.download(node, dir)
+                self.bot.get_cog('RadarrManager').radarr_api.auto_import_radarr(dir+'/'+node.getName(), '/downloads/films')
+                return
+                self.mega.download(node, dir, self.bot.get_cog('RadarrManager').radarr_api)
                 # If this is the first download, start the status updates
                 if len(self.mega.current_dls) == 1:
                     asyncio.create_task(self.status_message_task(ctx))
@@ -338,7 +337,7 @@ class MegaBot(commands.Cog):
         else:
             await ctx.send("Start a session")
             return
-    
+
     @commands.command()
     async def cancel(self, ctx):
         """
@@ -372,6 +371,7 @@ async def on_ready():
 async def main():
     async with bot:
         await bot.add_cog(MegaBot(bot))
+        await bot.add_cog(RadarrManager(bot))
         await bot.start(BOT_TOKEN)
 
 if __name__ == "__main__":

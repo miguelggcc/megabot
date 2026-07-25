@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Cog RadarrManager para gestión de Radarr.
-"""
-
 from discord.ext import commands, tasks
 import json
 import os
@@ -14,18 +9,17 @@ import time
 from aiohttp import web
 import asyncio
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class RadarrAPI:
 
-    def __init__(self, base_url, api_key):
-        self.base_url = base_url
-        self.api_key = api_key
-
-    def radarr_request(self,endpoint, method='GET', data=None):
-
-        self.api_key = os.getenv("RADARR_API_KEY")
+    def __init__(self):
         self.base_url = os.getenv("RADARR_BASE_URL")
+        self.api_key = os.getenv("RADARR_API_KEY")
+
+    def request(self, endpoint, method='GET', data=None):
         url = f"{self.base_url}/{endpoint}"
 
         body = json.dumps(data).encode('utf-8') if data else None
@@ -43,7 +37,7 @@ class RadarrAPI:
         except Exception as e:
             logging.error(f"Error: {e}")
             return None
-        
+
     def search_movie(self, titulo):
         return self.request(f"movie/lookup?term={urllib.parse.quote(titulo)}")
 
@@ -66,6 +60,98 @@ class RadarrAPI:
             "name": "RefreshMovie",
             "movieId": int(movie_id)
         })
+
+    def auto_import_radarr(self, file_path, save_to):
+
+        carpeta_padre = os.path.dirname(file_path)
+        file_path = os.path.abspath(file_path)
+        logging.info(file_path)
+        # 1. Escaneamos la carpeta
+        resultados = self.request(
+            f"manualimport?folder={urllib.parse.quote(carpeta_padre)}&filterExistingFiles=false")
+        archivo_a_importar = next(
+            (r for r in resultados if r['path'] == file_path), None)
+
+        if not archivo_a_importar:
+            logging.info("Radarr aún no ve este archivo.")
+            return
+        movie_id = None
+
+        # 2. Si ya reconoce la peli, usamos su ID
+        if archivo_a_importar.get('movie'):
+            logging.info(archivo_a_importar['movie'])
+            movie_id = archivo_a_importar['movie']['id']
+        else:
+            # 3. SI NO LA CONOCE: Buscamos en TMDB y la creamos!
+            # os.path.basename(carpeta_padre)
+            file_name = os.path.basename(file_path)
+            logging.info(
+                f"Buscando info para crear '{file_name}' en Radarr...")
+            busqueda = self.search_movie(file_name)
+
+            if busqueda:
+                pelicula_encontrada = busqueda[0]
+
+                nombre_oficial = f"{pelicula_encontrada['title']} ({pelicula_encontrada['year']})"
+                base_dir = os.path.dirname(os.path.normpath(file_path))
+                target_dir = os.path.join(save_to, nombre_oficial)
+                logging.info(target_dir)
+                try:
+                    if not os.path.exists(target_dir):
+                        os.makedirs(target_dir, exist_ok=True)
+                        logging.info(f"Carpeta creada: {target_dir}")
+                    else:
+                        logging.info(f"La carpeta ya existe, continuando...")
+                except Exception as e:
+                    logging.info(
+                        f"❌ Error crítico creando carpeta {target_dir}: {e}")
+                # Si ya existe, movemos el contenido dentro (y luego borramos la vacía)
+                for item in os.listdir(carpeta_padre):
+                    shutil.move(os.path.join(carpeta_padre, item), target_dir)
+
+                nueva_peli = self.add_movie(
+                    pelicula_encontrada['title'], pelicula_encontrada['year'],
+                    pelicula_encontrada['tmdbId'], save_to)
+
+                '''# Creamos la peli en Radarr
+                nueva_peli = radarr_request("movie", method='POST', data={
+                    "title": pelicula_encontrada['title'],
+                    "tmdbId": pelicula_encontrada['tmdbId'],
+                    "year": pelicula_encontrada['year'],
+                    "qualityProfileId": 1,
+                    "rootFolderPath": save_to,
+                    "monitored": True,
+                    "addOptions": {"searchForMovie": False}
+                })'''
+                movie_id = nueva_peli['id']
+                nuevo_path = os.path.join(target_dir, file_name)
+
+                '''# 3.6. Forzamos un re-escaneo de la nueva carpeta para que Radarr la vea
+                radarr_request("command", method='POST', data={
+                    "name": "RescanFolder",
+                    "folder": target_dir
+                })
+                # Damos tiempo a Radarr para que procese el nuevo path
+                import time
+                time.sleep(3) '''
+
+                # 4. Importamos usando el nuevo path y el movie_id
+                if movie_id:
+                    import_payload = [{
+                        "path": nuevo_path,  # <--- USAMOS LA RUTA NUEVA
+                        "movieId": movie_id,
+                        "quality": archivo_a_importar['quality'],
+                        "importMode": "move"
+                    }]
+                    self.request(
+                        "manualimport", method='POST', data=import_payload)
+                    logging.info(
+                        f"✅ Película importada a Radarr desde: {nuevo_path}")
+
+                # movie_id = nueva_peli['id']
+                logging.info(
+                    f"Película '{pelicula_encontrada['title']}' creada con éxito.")
+
 
 class FilesOrganizer:
 
@@ -101,9 +187,9 @@ class FilesOrganizer:
             logging.info(f"Ya existe: {nombre_oficial}")
         else:
             nueva_peli = self.radarr_api.add_movie(
-                pelicula['title'], 
-                pelicula['year'], 
-                tmdb_id, 
+                pelicula['title'],
+                pelicula['year'],
+                tmdb_id,
                 self.downloads_dir
             )
 
@@ -130,6 +216,7 @@ class FilesOrganizer:
             logging.error(f"Error refrescando: {e}")
 
         return True, nombre_oficial
+
 
 class PersistentQueue:
 
@@ -175,18 +262,16 @@ class PersistentQueue:
                 item['status'] = 'error'
         self.save(queue)
 
-class RadarrManagerCog(commands.Cog):
+
+class RadarrManager(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
 
-        with open('config.json') as f:
-            config = json.load(f)
-
-        self.radarr_api = RadarrAPI(config['radarr_url'], config['radarr_api_key'])
-        self.organizer = FilesOrganizer(self.radarr_api, config['downloads_dir'])
+        self.radarr_api = RadarrAPI()
+        self.organizer = FilesOrganizer(
+            self.radarr_api, os.getenv("DOWNLOADS_DIR"))
         self.queue = PersistentQueue()
-        self.config = config
         self.radarr_channel = None
 
         # Webhook
@@ -194,12 +279,19 @@ class RadarrManagerCog(commands.Cog):
         self.webhook_runner = None
         self.webhook_site = None
 
-        self.procesar_cola_task.start()
+        # self.procesar_cola_task.start()
 
     @commands.Cog.listener()
     async def on_ready(self):
-        self.radarr_channel = self.bot.get_channel(self.config['discord_channel_id'])
-        logging.info("✅ RadarrManage ready!")
+
+        try:
+            for guild in self.bot.guilds:
+                for channel in guild.text_channels:
+                    if channel.permissions_for(guild.me).send_messages:
+                        self.radarr_channel = channel
+        except:
+            logging.error("Error starting the bot")
+            logging.info("✅ RadarrManage ready!")
 
         await self._start_webhook_server()
 
@@ -220,14 +312,16 @@ class RadarrManagerCog(commands.Cog):
                 return web.Response(text='{"status": "error"}', content_type='application/json', status=500)
 
         self.webhook_app = web.Application()
-        self.webhook_app.router.add_post('/radarr-webhook', radarr_webhook_handler)
+        self.webhook_app.router.add_post(
+            '/radarr-webhook', radarr_webhook_handler)
 
         self.webhook_runner = web.AppRunner(self.webhook_app)
         await self.webhook_runner.setup()
-        self.webhook_site = web.TCPSite(self.webhook_runner, '0.0.0.0', 5000)
+        self.webhook_site = web.TCPSite(self.webhook_runner, '0.0.0.0', 5001)
         await self.webhook_site.start()
 
-        logging.info("✅ Webhook listening port 5000")
+        await self.radarr_channel.send("Radarr manager is running!")
+        logging.info("✅ Webhook listening port 5001")
 
     async def on_cog_unload(self):
         if self.webhook_runner:
@@ -241,11 +335,11 @@ class RadarrManagerCog(commands.Cog):
     def format_webhook_message(self, event_type, movie_title):
 
         emojis = {
-            'Import': '✅',
-            'Download': '🎬',
-            'Rename': '📝',
-            'MovieAdded': '➕',
-            'MovieDelete': '❌'
+            'Movie Imported': '✅',
+            'Movie Downloaded': '🎬',
+            'Movie Renamed': '📝',
+            'Movie Added': '➕',
+            'Movie Deleted': '❌'
         }
         emoji = emojis.get(event_type, '📌')
         return f"{emoji} **[Radarr]** {event_type}: **{movie_title}**"
