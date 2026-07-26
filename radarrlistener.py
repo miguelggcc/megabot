@@ -1,4 +1,5 @@
-from discord.ext import commands, tasks
+from discord.ext import commands
+import discord
 import json
 import os
 import logging
@@ -44,7 +45,7 @@ class RadarrAPI:
     def get_all_movies(self):
         return self.request("movie") or []
 
-    def add_movie(self, titulo, year, tmdb_id, root_folder, quality_profile=1):
+    def add_movie(self, titulo, year, tmdb_id, root_folder, quality_profile=1, search=False):
         return self.request("movie", method='POST', data={
             "title": titulo,
             "year": year,
@@ -52,7 +53,7 @@ class RadarrAPI:
             "qualityProfileId": quality_profile,
             "rootFolderPath": root_folder,
             "monitored": True,
-            "addOptions": {"searchForMovie": False}
+            "addOptions": {"searchForMovie": search}
         })
 
     def refresh_movie(self, movie_id):
@@ -60,7 +61,10 @@ class RadarrAPI:
             "name": "RefreshMovie",
             "movieId": int(movie_id)
         })
-
+        
+    def get_quality_profiles(self):
+        return self.request("qualityProfile")
+    
     def auto_import_radarr(self, file_path, save_to):
 
         carpeta_padre = os.path.dirname(file_path)
@@ -168,37 +172,37 @@ class FilesOrganizer:
         file_base = os.path.splitext(file_name)[0]
 
         logging.info(f"Searching '{file_base}'...")
-        busqueda = self.radarr_api.search_movie(file_base)
+        search = self.radarr_api.search_movie(file_base)
 
-        if not busqueda:
+        if not search:
             logging.error(f"Not found")
             return False, None
 
-        pelicula = busqueda[0]
-        nombre_oficial = f"{pelicula['title']} ({pelicula['year']})"
-        tmdb_id = pelicula['tmdbId']
+        movie = search[0]
+        title = f"{movie['title']} ({movie['year']})"
+        tmdb_id = movie['tmdbId']
         movie_id = None
 
-        todas = self.radarr_api.get_all_movies()
-        existe = any(p['tmdbId'] == tmdb_id for p in todas)
+        all_movies = self.radarr_api.get_all_movies()
+        already_exists = any(p['tmdbId'] == tmdb_id for p in all_movies)
 
-        if existe:
-            movie_id = next(p['id'] for p in todas if p['tmdbId'] == tmdb_id)
-            logging.info(f"Ya existe: {nombre_oficial}")
+        if already_exists:
+            movie_id = next(p['id'] for p in all_movies if p['tmdbId'] == tmdb_id)
+            logging.info(f"{title} already exists")
         else:
-            nueva_peli = self.radarr_api.add_movie(
-                pelicula['title'],
-                pelicula['year'],
+            new_movie = self.radarr_api.add_movie(
+                movie['title'],
+                movie['year'],
                 tmdb_id,
                 self.downloads_dir
             )
 
-            if not nueva_peli:
+            if not new_movie:
                 return False, None
 
-            movie_id = nueva_peli['id']
+            movie_id = new_movie['id']
 
-        target_dir = os.path.join(self.downloads_dir, nombre_oficial)
+        target_dir = os.path.join(self.downloads_dir, title)
 
         try:
             if not os.path.exists(target_dir):
@@ -215,7 +219,7 @@ class FilesOrganizer:
         except Exception as e:
             logging.error(f"Error refrescando: {e}")
 
-        return True, nombre_oficial
+        return True, title
 
 
 class PersistentQueue:
@@ -273,7 +277,14 @@ class RadarrManager(commands.Cog):
             self.radarr_api, os.getenv("DOWNLOADS_DIR"))
         self.queue = PersistentQueue()
         self.radarr_channel = None
-
+        self.events = {
+            'Import': ('✅', 'Imported movie', 0x00ff00),
+            'Grab': ('🔎', 'Grabbed movie', 0x00ff99),
+            'Download': ('🎬', 'Downloaded movie', 0x0099ff),
+            'Rename': ('📝', 'Renamed movie', 0xffff00),
+            'MovieAdded': ('➕', 'Added movie', 0x00ff00),
+            'MovieDelete': ('❌', 'Deleted movie', 0xff0000),
+        }
         # Webhook
         self.webhook_app = None
         self.webhook_runner = None
@@ -303,12 +314,13 @@ class RadarrManager(commands.Cog):
             try:
                 data = await request.json()
                 event = data.get('eventType', 'Unknown')
-                titulo = data.get('movie', {}).get('title', 'Desconocida')
-                await self.send_webhook_message(event, titulo)
+                movie = data.get('movie', {})
+                title = f"{movie.get('title', 'Unknown')} ({movie.get('year', 'Unknown')})"
+                await self.send_webhook_message(event, title)
 
                 return web.Response(text='{"status": "ok"}', content_type='application/json')
             except Exception as e:
-                logging.error(f"Error en webhook: {e}")
+                logging.error(f"Error in webhook: {e}")
                 return web.Response(text='{"status": "error"}', content_type='application/json', status=500)
 
         self.webhook_app = web.Application()
@@ -332,26 +344,23 @@ class RadarrManager(commands.Cog):
     def add_to_queue(self, file_path):
         self.queue.add(file_path)
 
-    def format_webhook_message(self, event_type, movie_title):
-
-        emojis = {
-            'Movie Imported': '✅',
-            'Movie Downloaded': '🎬',
-            'Movie Renamed': '📝',
-            'Movie Added': '➕',
-            'Movie Deleted': '❌'
-        }
-        emoji = emojis.get(event_type, '📌')
-        return f"{emoji} **[Radarr]** {event_type}: **{movie_title}**"
-
     async def send_webhook_message(self, event_type, movie_title):
         if not self.radarr_channel:
             logging.warning("Radarr channel not configured")
             return False
 
-        mensaje = self.format_webhook_message(event_type, movie_title)
-        await self.radarr_channel.send(mensaje)
-        logging.info(f"Webhook sent: {event_type} - {movie_title}")
+        emoji, action, color = self.events.get(
+            event_type, ('📌', str(event_type), 0x808080))
+
+        embed = discord.Embed(
+            title=f"{emoji} {action}",
+            description=f"`{movie_title}`",
+            color=color
+        )
+        embed.set_footer(text="Radarr")
+
+        await self.radarr_channel.send(embed=embed)
+        logging.info(f"Webhook: {event_type} - {movie_title}")
         return True
 
     # ============= TASKS =============
@@ -396,7 +405,65 @@ class RadarrManager(commands.Cog):
             logging.error(f"Error Plex: {e}")'''
 
     # ============= COMANDOS =============
+    @commands.command()
+    async def add(self, ctx, title=commands.parameter(
+            default=None, description="Movie title")):
+        search = self.radarr_api.search_movie(title)
 
+        if search:
+            movie = search[0]
+        title = movie['title']
+        year = movie['year']
+        tmdb_id = movie['tmdbId']
+
+        # Verificar si existe
+        if any(p['tmdbId'] == tmdb_id for p in self.radarr_api.get_all_movies()):
+            await ctx.send(f"`{title} ({year})` already exists")
+            return
+
+        question = await ctx.send(f"Do you want to download the movie `{title} ({year})`?")
+        await question.add_reaction('✅')
+        await question.add_reaction('❌')
+
+        def check(reaction, user): return reaction.message.id == question.id and user == ctx.message.author and str(
+            reaction.emoji) in ['✅', '❌']
+        try:
+            reaction, user = await self.bot.wait_for('reaction_add', timeout=60.0, check=check)
+            match str(reaction.emoji):
+                case '✅':
+                    await ctx.send(f"➕ Adding: **{title} ({year})**...")
+                    self.radarr_api.add_movie(
+                        titulo=title,
+                        year=year,
+                        tmdb_id=tmdb_id,
+                        root_folder="/downloads/films/",
+                        quality_profile=4,
+                        search=True
+                    )
+                case _:
+                    await self.cancel(ctx)
+        except asyncio.TimeoutError:
+            await ctx.send('You took too long to respond! Please try again.')
+            return
+        except Exception as e:
+            logging.error(f"Error downloding: {e}")
+            return
+
+    @commands.command(name='quality_profiles')
+    async def list_quality_profiles(self, ctx):
+
+        profiles = self.radarr_api.get_quality_profiles()
+
+        if not profiles:
+            await ctx.send("❌ No profiles found")
+            return
+
+        msg = "📊 **Quality Profiles:**\n"
+        for profile in profiles:
+            msg += f"• ID `{profile['id']}`: {profile['name']}\n"
+
+        await ctx.send(msg)
+    
     @commands.command(name='status')
     async def status(self, ctx):
         """Ver estado de la cola"""
