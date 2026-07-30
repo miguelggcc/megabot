@@ -67,160 +67,74 @@ class RadarrAPI:
     
     def auto_import_radarr(self, file_path, save_to):
 
-        carpeta_padre = os.path.dirname(file_path)
+        father_dir = os.path.dirname(file_path)
         file_path = os.path.abspath(file_path)
         logging.info(file_path)
-        # 1. Escaneamos la carpeta
-        resultados = self.request(
-            f"manualimport?folder={urllib.parse.quote(carpeta_padre)}&filterExistingFiles=false")
-        archivo_a_importar = next(
-            (r for r in resultados if r['path'] == file_path), None)
+        # 1. Scan directory
+        res = self.request(
+            f"manualimport?folder={urllib.parse.quote(father_dir)}&filterExistingFiles=false")
+        files = next(
+            (r for r in res if r['path'] == file_path), None)
 
-        if not archivo_a_importar:
-            logging.info("Radarr aún no ve este archivo.")
+        if not files:
+            logging.error("Radarr can't see file.")
             return
         movie_id = None
 
-        # 2. Si ya reconoce la peli, usamos su ID
-        if archivo_a_importar.get('movie'):
-            logging.info(archivo_a_importar['movie'])
-            movie_id = archivo_a_importar['movie']['id']
+        # Movie already in the library
+        if files.get('movie'):
+            logging.info(files['movie'])
+            movie_id = files['movie']['id']
         else:
-            # 3. SI NO LA CONOCE: Buscamos en TMDB y la creamos!
+            # If not in library, search and create
             # os.path.basename(carpeta_padre)
             file_name = os.path.basename(file_path)
             logging.info(
-                f"Buscando info para crear '{file_name}' en Radarr...")
-            busqueda = self.search_movie(file_name)
+                f"Seraching info of '{file_name}' in Radarr...")
+            search = self.search_movie(file_name)
 
-            if busqueda:
-                pelicula_encontrada = busqueda[0]
+            if search:
+                found_movie = search[0]
 
-                nombre_oficial = f"{pelicula_encontrada['title']} ({pelicula_encontrada['year']})"
+                title = f"{found_movie['title']} ({found_movie['year']})"
                 base_dir = os.path.dirname(os.path.normpath(file_path))
-                target_dir = os.path.join(save_to, nombre_oficial)
+                target_dir = os.path.join(save_to, title)
                 logging.info(target_dir)
                 try:
                     if not os.path.exists(target_dir):
                         os.makedirs(target_dir, exist_ok=True)
-                        logging.info(f"Carpeta creada: {target_dir}")
+                        logging.info(f"Directory created: {target_dir}")
                     else:
-                        logging.info(f"La carpeta ya existe, continuando...")
+                        logging.info(f"Directory already exists...")
                 except Exception as e:
-                    logging.info(
-                        f"❌ Error crítico creando carpeta {target_dir}: {e}")
-                # Si ya existe, movemos el contenido dentro (y luego borramos la vacía)
-                for item in os.listdir(carpeta_padre):
-                    shutil.move(os.path.join(carpeta_padre, item), target_dir)
+                    logging.error(
+                        f"Error craeting directory {target_dir}: {e}")
+                # If it already exists, move the content and delete directory once empty
+                for item in os.listdir(father_dir):
+                    shutil.move(os.path.join(father_dir, item), target_dir)
 
-                nueva_peli = self.add_movie(
-                    pelicula_encontrada['title'], pelicula_encontrada['year'],
-                    pelicula_encontrada['tmdbId'], save_to)
+                new_movie = self.add_movie(
+                    found_movie['title'], found_movie['year'],
+                    found_movie['tmdbId'], save_to)
 
-                '''# Creamos la peli en Radarr
-                nueva_peli = radarr_request("movie", method='POST', data={
-                    "title": pelicula_encontrada['title'],
-                    "tmdbId": pelicula_encontrada['tmdbId'],
-                    "year": pelicula_encontrada['year'],
-                    "qualityProfileId": 1,
-                    "rootFolderPath": save_to,
-                    "monitored": True,
-                    "addOptions": {"searchForMovie": False}
-                })'''
-                movie_id = nueva_peli['id']
-                nuevo_path = os.path.join(target_dir, file_name)
+                movie_id = new_movie['id']
+                new_path = os.path.join(target_dir, file_name)
 
-                '''# 3.6. Forzamos un re-escaneo de la nueva carpeta para que Radarr la vea
-                radarr_request("command", method='POST', data={
-                    "name": "RescanFolder",
-                    "folder": target_dir
-                })
-                # Damos tiempo a Radarr para que procese el nuevo path
-                import time
-                time.sleep(3) '''
-
-                # 4. Importamos usando el nuevo path y el movie_id
+                # Import from the new path
                 if movie_id:
                     import_payload = [{
-                        "path": nuevo_path,  # <--- USAMOS LA RUTA NUEVA
+                        "path": new_path,  # <--- NEW PATH
                         "movieId": movie_id,
-                        "quality": archivo_a_importar['quality'],
+                        "quality": files['quality'],
                         "importMode": "move"
                     }]
                     self.request(
                         "manualimport", method='POST', data=import_payload)
                     logging.info(
-                        f"✅ Película importada a Radarr desde: {nuevo_path}")
+                        f"Movie imported to Radarr from: {new_path}")
 
-                # movie_id = nueva_peli['id']
                 logging.info(
-                    f"Película '{pelicula_encontrada['title']}' creada con éxito.")
-
-
-class FilesOrganizer:
-
-    def __init__(self, radarr_api, downloads_dir):
-        self.radarr_api = radarr_api
-        self.downloads_dir = downloads_dir
-
-    def organize_file(self, file_path):
-        if not os.path.isfile(file_path):
-            logging.error(f"Not found: {file_path}")
-            return False, None
-
-        file_name = os.path.basename(file_path)
-        file_base = os.path.splitext(file_name)[0]
-
-        logging.info(f"Searching '{file_base}'...")
-        search = self.radarr_api.search_movie(file_base)
-
-        if not search:
-            logging.error(f"Not found")
-            return False, None
-
-        movie = search[0]
-        title = f"{movie['title']} ({movie['year']})"
-        tmdb_id = movie['tmdbId']
-        movie_id = None
-
-        all_movies = self.radarr_api.get_all_movies()
-        already_exists = any(p['tmdbId'] == tmdb_id for p in all_movies)
-
-        if already_exists:
-            movie_id = next(p['id'] for p in all_movies if p['tmdbId'] == tmdb_id)
-            logging.info(f"{title} already exists")
-        else:
-            new_movie = self.radarr_api.add_movie(
-                movie['title'],
-                movie['year'],
-                tmdb_id,
-                self.downloads_dir
-            )
-
-            if not new_movie:
-                return False, None
-
-            movie_id = new_movie['id']
-
-        target_dir = os.path.join(self.downloads_dir, title)
-
-        try:
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir, mode=0o775, exist_ok=True)
-
-            target_file = os.path.join(target_dir, file_name)
-            shutil.move(file_path, target_file)
-        except Exception as e:
-            logging.error(f"Error: {e}")
-            return False, None
-
-        try:
-            self.radarr_api.refresh_movie(movie_id)
-        except Exception as e:
-            logging.error(f"Error refrescando: {e}")
-
-        return True, title
-
+                    f"Movie '{found_movie['title']}' created successfully.")
 
 class PersistentQueue:
 
@@ -273,8 +187,6 @@ class RadarrManager(commands.Cog):
         self.bot = bot
 
         self.radarr_api = RadarrAPI()
-        self.organizer = FilesOrganizer(
-            self.radarr_api, os.getenv("DOWNLOADS_DIR"))
         self.queue = PersistentQueue()
         self.radarr_channel = None
         self.events = {
@@ -464,9 +376,9 @@ class RadarrManager(commands.Cog):
 
         await ctx.send(msg)
     
-    @commands.command(name='status')
+    @commands.command()
     async def status(self, ctx):
-        """Ver estado de la cola"""
+        """Stuts of queue"""
         queue = self.queue.load()
         pending = len([q for q in queue if q['status'] == 'pending'])
         completed = len([q for q in queue if q['status'] == 'completed'])
@@ -474,3 +386,72 @@ class RadarrManager(commands.Cog):
 
         msg = f"📋 **Queue:** {len(queue)} total | ⏳ {pending} pending | ✅ {completed} completed | ❌ {errors} errors"
         await ctx.send(msg)
+        
+    @commands.command()
+    async def health(self, ctx):
+        """Radarr health status with size and downloading movies"""
+        try:
+            
+            all_movies = self.radarr_api.get_all_movies()
+            downloaded = [m for m in all_movies if m.get('hasFile')]
+            monitored = [m for m in all_movies if m.get('monitored')]
+            missing = [m for m in monitored if not m.get('hasFile')]
+
+            # Calculate total size (in bytes)
+            total_size_bytes = sum(m.get('sizeOnDisk', 0) for m in downloaded)
+
+            size_gb = round(total_size_bytes/ (1024**3), 2)
+
+            # Create embed
+            embed = discord.Embed(
+                title="📊 Radarr Health Status",
+                color=0x00ff00 if missing == [] else 0xffaa00
+            )
+
+            # General summary
+            embed.add_field(
+                name="📈 Summary",
+                value=f"Total: `{len(all_movies)}`\n"
+                    f"Downloaded: `{len(downloaded)}`\n"
+                    f"Monitored: `{len(monitored)}`\n"
+                    f"Missing: `{len(missing)}`",
+                inline=False
+            )
+
+            # Library size
+            embed.add_field(
+                name="💾 Library Size",
+                value=f"`{size_gb:.2f} GB` ({len(downloaded)} movies)",
+                inline=False
+            )
+
+            if missing:
+                # Show maximum 15 movies to avoid clutter
+                searching_list = ""
+                for i, movie in enumerate(missing[:15], 1):
+                    searching_list += f"{i}. **{movie['title']}** ({movie['year']})\n"
+
+                if len(missing) > 15:
+                    searching_list += f"\n... and {len(missing) - 15} more"
+
+                embed.add_field(
+                    name=f"🔎 Searching for downloads ({len(missing)})",
+                    value=searching_list,
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="🔎 Searching for downloads",
+                    value="✅ None",
+                    inline=False
+                )
+
+            # Footer with timestamp
+            since = min(all_movies, key=lambda x: x['added'])['added'][:10] if all_movies else "N/A"
+            embed.set_footer(text=f"Since: {since}")
+
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            logging.error(f"Error in Radarr: {e}")
+            await ctx.send(f"❌ Error: {e}")
