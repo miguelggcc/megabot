@@ -61,10 +61,10 @@ class RadarrAPI:
             "name": "RefreshMovie",
             "movieId": int(movie_id)
         })
-        
+
     def get_quality_profiles(self):
         return self.request("qualityProfile")
-    
+
     def auto_import_radarr(self, file_path, save_to):
 
         father_dir = os.path.dirname(file_path)
@@ -135,6 +135,7 @@ class RadarrAPI:
 
                 logging.info(
                     f"Movie '{found_movie['title']}' created successfully.")
+
 
 class PersistentQueue:
 
@@ -226,9 +227,8 @@ class RadarrManager(commands.Cog):
             try:
                 data = await request.json()
                 event = data.get('eventType', 'Unknown')
-                movie = data.get('movie', {})
-                title = f"{movie.get('title', 'Unknown')} ({movie.get('year', 'Unknown')})"
-                await self.send_webhook_message(event, title)
+               
+                await self.send_webhook_message(event, data)
 
                 return web.Response(text='{"status": "ok"}', content_type='application/json')
             except Exception as e:
@@ -256,7 +256,7 @@ class RadarrManager(commands.Cog):
     def add_to_queue(self, file_path):
         self.queue.add(file_path)
 
-    async def send_webhook_message(self, event_type, movie_title):
+    async def send_webhook_message(self, event_type, data):
         if not self.radarr_channel:
             logging.warning("Radarr channel not configured")
             return False
@@ -264,11 +264,52 @@ class RadarrManager(commands.Cog):
         emoji, action, color = self.events.get(
             event_type, ('📌', str(event_type), 0x808080))
 
+        movie = data.get('movie', {})
+        movie_title = f"{movie.get('title', 'Unknown')} ({movie.get('year', 'Unknown')})"
+        
         embed = discord.Embed(
             title=f"{emoji} {action}",
             description=f"`{movie_title}`",
             color=color
         )
+        
+        if event_type == 'Grab' and data:
+            release_info = data.get('release', {})
+
+            if 'title' in release_info:
+                embed.add_field(
+                    name="📦 Release",
+                    value=f"`{release_info['title']}`",
+                    inline=False
+                )
+
+            if 'size' in release_info:
+                size_gb = round(release_info['size'] / (1024**3), 2)
+                embed.add_field(
+                    name="💾 Size",
+                    value=f"`{size_gb} GB`",
+                    inline=True
+                )
+
+            if 'quality' in release_info:
+                quality = release_info['quality'].get('quality', {})
+                if isinstance(quality, dict):
+                    quality_name = quality.get('name', 'Unknown')
+                else:
+                    quality_name = str(quality)
+                embed.add_field(
+                    name="📹 Quality",
+                    value=f"`{quality_name}`",
+                    inline=True
+                )
+
+            if 'indexer' in release_info:
+                embed.add_field(
+                    name="🔗 Indexer",
+                    value=f"`{release_info['indexer']}`",
+                    inline=True
+                )
+            
         embed.set_footer(text="Radarr")
 
         await self.radarr_channel.send(embed=embed)
@@ -320,6 +361,7 @@ class RadarrManager(commands.Cog):
     @commands.command()
     async def add(self, ctx, title=commands.parameter(
             default=None, description="Movie title")):
+
         search = self.radarr_api.search_movie(title)
 
         if search:
@@ -343,13 +385,12 @@ class RadarrManager(commands.Cog):
             reaction, user = await self.bot.wait_for('reaction_add', timeout=60.0, check=check)
             match str(reaction.emoji):
                 case '✅':
-                    await ctx.send(f"➕ Adding: **{title} ({year})**...")
                     self.radarr_api.add_movie(
                         titulo=title,
                         year=year,
                         tmdb_id=tmdb_id,
                         root_folder="/downloads/films/",
-                        quality_profile=4,
+                        quality_profile=9,
                         search=True
                     )
                 case _:
@@ -375,7 +416,7 @@ class RadarrManager(commands.Cog):
             msg += f"• ID `{profile['id']}`: {profile['name']}\n"
 
         await ctx.send(msg)
-    
+
     @commands.command()
     async def status(self, ctx):
         """Stuts of queue"""
@@ -386,12 +427,12 @@ class RadarrManager(commands.Cog):
 
         msg = f"📋 **Queue:** {len(queue)} total | ⏳ {pending} pending | ✅ {completed} completed | ❌ {errors} errors"
         await ctx.send(msg)
-        
+
     @commands.command()
     async def health(self, ctx):
         """Radarr health status with size and downloading movies"""
         try:
-            
+
             all_movies = self.radarr_api.get_all_movies()
             downloaded = [m for m in all_movies if m.get('hasFile')]
             monitored = [m for m in all_movies if m.get('monitored')]
@@ -400,7 +441,7 @@ class RadarrManager(commands.Cog):
             # Calculate total size (in bytes)
             total_size_bytes = sum(m.get('sizeOnDisk', 0) for m in downloaded)
 
-            size_gb = round(total_size_bytes/ (1024**3), 2)
+            size_gb = round(total_size_bytes / (1024**3), 2)
 
             # Create embed
             embed = discord.Embed(
@@ -412,9 +453,9 @@ class RadarrManager(commands.Cog):
             embed.add_field(
                 name="📈 Summary",
                 value=f"Total: `{len(all_movies)}`\n"
-                    f"Downloaded: `{len(downloaded)}`\n"
-                    f"Monitored: `{len(monitored)}`\n"
-                    f"Missing: `{len(missing)}`",
+                f"Downloaded: `{len(downloaded)}`\n"
+                f"Monitored: `{len(monitored)}`\n"
+                f"Missing: `{len(missing)}`",
                 inline=False
             )
 
@@ -447,7 +488,8 @@ class RadarrManager(commands.Cog):
                 )
 
             # Footer with timestamp
-            since = min(all_movies, key=lambda x: x['added'])['added'][:10] if all_movies else "N/A"
+            since = min(all_movies, key=lambda x: x['added'])[
+                'added'][:10] if all_movies else "N/A"
             embed.set_footer(text=f"Since: {since}")
 
             await ctx.send(embed=embed)
