@@ -65,6 +65,10 @@ class RadarrAPI:
     def get_quality_profiles(self):
         return self.request("qualityProfile")
 
+    def get_queue(self):
+        """Get current download queue"""
+        return self.request("queue") or []
+    
     def auto_import_radarr(self, file_path, save_to):
 
         father_dir = os.path.dirname(file_path)
@@ -192,7 +196,7 @@ class RadarrManager(commands.Cog):
         self.radarr_channel = None
         self.events = {
             'Import': ('✅', 'Imported movie', 0x00ff00),
-            'Grab': ('🔎', 'Grabbed movie', 0x00ff99),
+            'Grab': ('🔎', 'Grabbed movie', 0x5cffbd),
             'Download': ('🎬', 'Downloaded movie', 0x0099ff),
             'Rename': ('📝', 'Renamed movie', 0xffff00),
             'MovieAdded': ('➕', 'Added movie', 0x00ff00),
@@ -215,7 +219,7 @@ class RadarrManager(commands.Cog):
                         self.radarr_channel = channel
         except:
             logging.error("Error starting the bot")
-            logging.info("✅ RadarrManage ready!")
+            logging.info("✅ RadarrManager ready!")
 
         await self._start_webhook_server()
 
@@ -227,7 +231,6 @@ class RadarrManager(commands.Cog):
             try:
                 data = await request.json()
                 event = data.get('eventType', 'Unknown')
-               
                 await self.send_webhook_message(event, data)
 
                 return web.Response(text='{"status": "ok"}', content_type='application/json')
@@ -265,51 +268,95 @@ class RadarrManager(commands.Cog):
             event_type, ('📌', str(event_type), 0x808080))
 
         movie = data.get('movie', {})
+      
         movie_title = f"{movie.get('title', 'Unknown')} ({movie.get('year', 'Unknown')})"
-        
+
         embed = discord.Embed(
             title=f"{emoji} {action}",
             description=f"`{movie_title}`",
             color=color
         )
-        
+
         if event_type == 'Grab' and data:
             release_info = data.get('release', {})
 
-            if 'title' in release_info:
-                embed.add_field(
-                    name="📦 Release",
-                    value=f"`{release_info['title']}`",
-                    inline=False
-                )
+            try:
+                release = data.get('release', {})
 
-            if 'size' in release_info:
-                size_gb = round(release_info['size'] / (1024**3), 2)
-                embed.add_field(
-                    name="💾 Size",
-                    value=f"`{size_gb} GB`",
-                    inline=True
-                )
+                if isinstance(release, dict):
+                    # Release name
+                    release_title = release.get('releaseTitle')
+                    if release_title:
+                        embed.add_field(
+                            name="📦 Release",
+                            value=f"`{release_title}`",
+                            inline=False
+                        )
 
-            if 'quality' in release_info:
-                quality = release_info['quality'].get('quality', {})
-                if isinstance(quality, dict):
-                    quality_name = quality.get('name', 'Unknown')
-                else:
-                    quality_name = str(quality)
-                embed.add_field(
-                    name="📹 Quality",
-                    value=f"`{quality_name}`",
-                    inline=True
-                )
+                    # Size & Bitrate
+                    size_bytes = release.get('size')
+                    runtime_minutes = movie.get('runtime')
 
-            if 'indexer' in release_info:
-                embed.add_field(
-                    name="🔗 Indexer",
-                    value=f"`{release_info['indexer']}`",
-                    inline=True
-                )
-            
+                    if size_bytes:
+                        size_gb = round(size_bytes / (1024**3), 2)
+
+                        # Calcular bitrate si tenemos runtime
+                        bitrate_str = f"`{size_gb} GB`"
+
+                        if runtime_minutes and runtime_minutes > 0:
+                            bitrate_mbps = (size_bytes * 8) / (runtime_minutes*60) / 1e6
+                            bitrate_str += f" (`{bitrate_mbps:.1f} Mbps`)"
+
+                        embed.add_field(
+                            name="💾 Size",
+                            value=bitrate_str,
+                            inline=False
+                        )
+
+                    quality = release.get('quality')
+                    if quality:
+                        embed.add_field(
+                            name="📹 Quality",
+                            value=f"`{quality}`",
+                            inline=True
+                        )
+
+                    indexer = release.get('indexer')
+                    if indexer:
+                        embed.add_field(
+                            name="🔗 Indexer",
+                            value=f"`{indexer}`",
+                            inline=True
+                        )
+
+                    release_group = release.get('releaseGroup')
+                    if release_group:
+                        embed.add_field(
+                            name="👥 Release Group",
+                            value=f"`{release_group}`",
+                            inline=True
+                        )
+
+                    custom_formats = release.get('customFormats', [])
+                    if custom_formats:
+                        formats_str = ", ".join(custom_formats)
+                        embed.add_field(
+                            name="🎯 Custom Formats",
+                            value=f"`{formats_str}`",
+                            inline=False
+                        )
+
+                    '''indexer_flags = release.get('indexerFlags', [])
+                    if indexer_flags:
+                        flags_str = ", ".join(indexer_flags)
+                        embed.add_field(
+                            name="🚩 Flags",
+                            value=f"`{flags_str}`",
+                            inline=False
+                        )'''
+            except Exception as e:
+                logging.warning(f"Could not parse release info: {e}")
+                
         embed.set_footer(text="Radarr")
 
         await self.radarr_channel.send(embed=embed)
@@ -359,13 +406,24 @@ class RadarrManager(commands.Cog):
 
     # ============= COMANDOS =============
     @commands.command()
-    async def add(self, ctx, title=commands.parameter(
-            default=None, description="Movie title")):
+    async def add(self, ctx,
+                  title=commands.parameter(
+                      default=None, description="Movie title"),
+                  quality_profile: int = commands.parameter(default=9, description="Quality profile ID (default = 1080p Efficient)")):
+
+        profiles = self.radarr_api.get_quality_profiles()
+
+        if not profiles or not profiles[quality_profile]:
+            await ctx.send(f"❌ No profile {quality_profile} found")
+            return
 
         search = self.radarr_api.search_movie(title)
 
         if search:
             movie = search[0]
+        else:
+            await ctx.send(f"❌ No movie {title} found")
+            return
         title = movie['title']
         year = movie['year']
         tmdb_id = movie['tmdbId']
@@ -375,7 +433,7 @@ class RadarrManager(commands.Cog):
             await ctx.send(f"`{title} ({year})` already exists")
             return
 
-        question = await ctx.send(f"Do you want to download the movie `{title} ({year})`?")
+        question = await ctx.send(f"Do you want to download the movie `{title} ({year})` in `{profiles[quality_profile-1]['name']}`?")
         await question.add_reaction('✅')
         await question.add_reaction('❌')
 
@@ -383,18 +441,17 @@ class RadarrManager(commands.Cog):
             reaction.emoji) in ['✅', '❌']
         try:
             reaction, user = await self.bot.wait_for('reaction_add', timeout=60.0, check=check)
-            match str(reaction.emoji):
-                case '✅':
-                    self.radarr_api.add_movie(
-                        titulo=title,
-                        year=year,
-                        tmdb_id=tmdb_id,
-                        root_folder="/downloads/films/",
-                        quality_profile=9,
-                        search=True
-                    )
-                case _:
-                    await self.cancel(ctx)
+
+            if str(reaction.emoji) == '✅':
+                self.radarr_api.add_movie(
+                    titulo=title,
+                    year=year,
+                    tmdb_id=tmdb_id,
+                    root_folder="/downloads/films/",
+                    quality_profile=quality_profile,
+                    search=True
+                )
+
         except asyncio.TimeoutError:
             await ctx.send('You took too long to respond! Please try again.')
             return
@@ -419,7 +476,7 @@ class RadarrManager(commands.Cog):
 
     @commands.command()
     async def status(self, ctx):
-        """Stuts of queue"""
+        """Status of queue"""
         queue = self.queue.load()
         pending = len([q for q in queue if q['status'] == 'pending'])
         completed = len([q for q in queue if q['status'] == 'completed'])
@@ -436,8 +493,17 @@ class RadarrManager(commands.Cog):
             all_movies = self.radarr_api.get_all_movies()
             downloaded = [m for m in all_movies if m.get('hasFile')]
             monitored = [m for m in all_movies if m.get('monitored')]
-            missing = [m for m in monitored if not m.get('hasFile')]
-
+            #missing = [m for m in monitored if not m.get('hasFile')]
+            queue_response = self.radarr_api.get_queue()
+            if isinstance(queue_response, dict):
+                queue = queue_response.get('records', [])
+            elif isinstance(queue_response, list):
+                queue = queue_response
+            else:
+                queue = []
+            downloading_movie_ids = [item.get('movieId') for item in queue]
+            missing = [m for m in monitored if not m.get('hasFile') and m['id'] not in downloading_movie_ids]
+            
             # Calculate total size (in bytes)
             total_size_bytes = sum(m.get('sizeOnDisk', 0) for m in downloaded)
 
@@ -487,6 +553,47 @@ class RadarrManager(commands.Cog):
                     inline=False
                 )
 
+            # Currently downloading
+            if queue:
+                downloading_list = ""   
+                for i, item in enumerate(queue[:10], 1):
+                    # ← Verificar que item es diccionario
+                    if not isinstance(item, dict):
+                        continue
+
+                    movie_title = item.get('title', 'Unknown')
+
+                    # Progress
+                    sizeleft = item.get('sizeleft', 0)
+                    size = item.get('size', 1)
+
+                    if size > 0:
+                        progress_percent = round(((size - sizeleft) / size) * 100, 1)
+                    else:
+                        progress_percent = 0
+
+                    # Timeleft
+                    timeleft = item.get('timeleft')
+                    time_str = ""
+                    if timeleft:
+                        time_str = str(timeleft)
+
+
+                    downloading_list += (
+                        f"{i}. **{movie_title}**\n"
+                        f"   `{progress_percent}%` | "
+                        f"Time left: `{time_str}`\n"
+                    )
+
+                if len(queue) > 10:
+                    downloading_list += f"\n... and {len(queue) - 10} more"
+
+                embed.add_field(
+                    name=f"⬇️ Downloading ({len(queue)})",
+                    value=downloading_list,
+                    inline=False
+                )
+            
             # Footer with timestamp
             since = min(all_movies, key=lambda x: x['added'])[
                 'added'][:10] if all_movies else "N/A"
