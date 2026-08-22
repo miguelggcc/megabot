@@ -9,6 +9,7 @@ import shutil
 import time
 from aiohttp import web
 import asyncio
+from letterboxdparser import LetterboxdParser
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +20,7 @@ class RadarrAPI:
     def __init__(self):
         self.base_url = os.getenv("RADARR_BASE_URL")
         self.api_key = os.getenv("RADARR_API_KEY")
+        self.timeout = 30
 
     def request(self, endpoint, method='GET', data=None):
         url = f"{self.base_url}/{endpoint}"
@@ -30,7 +32,7 @@ class RadarrAPI:
         req.add_header('X-Api-Key', self.api_key)
 
         try:
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 return json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             logging.error(f"Error HTTP {e.code}")
@@ -39,15 +41,18 @@ class RadarrAPI:
             logging.error(f"Error: {e}")
             return None
 
-    def search_movie(self, titulo):
-        return self.request(f"movie/lookup?term={urllib.parse.quote(titulo)}")
+    def search_movie(self, title):
+        return self.request(f"movie/lookup?term={urllib.parse.quote(title)}")
+
+    def get_movie(self, movie_id):
+        return self.request(f"movie/{movie_id}")
 
     def get_all_movies(self):
         return self.request("movie") or []
 
-    def add_movie(self, titulo, year, tmdb_id, root_folder, quality_profile=1, search=False):
+    def add_movie(self, title, year, tmdb_id, root_folder, quality_profile=1, search=False):
         return self.request("movie", method='POST', data={
-            "title": titulo,
+            "title": title,
             "year": year,
             "tmdbId": tmdb_id,
             "qualityProfileId": quality_profile,
@@ -68,12 +73,12 @@ class RadarrAPI:
     def get_queue(self):
         """Get current download queue"""
         return self.request("queue") or []
-    
+
     def auto_import_radarr(self, file_path, save_to):
 
         father_dir = os.path.dirname(file_path)
         file_path = os.path.abspath(file_path)
-        logging.info(file_path)
+
         # 1. Scan directory
         res = self.request(
             f"manualimport?folder={urllib.parse.quote(father_dir)}&filterExistingFiles=false")
@@ -193,6 +198,12 @@ class RadarrManager(commands.Cog):
 
         self.radarr_api = RadarrAPI()
         self.queue = PersistentQueue()
+        letterboxd_user = os.getenv("LETTERBOXD_USER")
+        if letterboxd_user:
+            self.letterboxd = LetterboxdParser(letterboxd_user)
+
+        self.root_folder = os.getenv("DOWNLOADS_DIR")
+
         self.radarr_channel = None
         self.events = {
             'Import': ('✅', 'Imported movie', 0x00ff00),
@@ -202,6 +213,7 @@ class RadarrManager(commands.Cog):
             'MovieAdded': ('➕', 'Added movie', 0x00ff00),
             'MovieDelete': ('❌', 'Deleted movie', 0xff0000),
         }
+
         # Webhook
         self.webhook_app = None
         self.webhook_runner = None
@@ -268,7 +280,7 @@ class RadarrManager(commands.Cog):
             event_type, ('📌', str(event_type), 0x808080))
 
         movie = data.get('movie', {})
-      
+
         movie_title = f"{movie.get('title', 'Unknown')} ({movie.get('year', 'Unknown')})"
 
         embed = discord.Embed(
@@ -295,21 +307,28 @@ class RadarrManager(commands.Cog):
 
                     # Size & Bitrate
                     size_bytes = release.get('size')
-                    runtime_minutes = movie.get('runtime')
+
+                    movie_id = movie.get("id")
+                    runtime_minutes = None
+                    if movie_id:
+                        movie_details = self.radarr_api.get_movie(movie_id)
+                        if movie_details:
+                            runtime_minutes = movie_details.get("runtime")
 
                     if size_bytes:
-                        size_gb = round(size_bytes / (1024**3), 2)
+                        size_gb = round(size_bytes / 1e9, 2)
 
                         # Calcular bitrate si tenemos runtime
-                        bitrate_str = f"`{size_gb} GB`"
+                        size_str = f"`{size_gb} GB`"
 
                         if runtime_minutes and runtime_minutes > 0:
-                            bitrate_mbps = (size_bytes * 8) / (runtime_minutes*60) / 1e6
-                            bitrate_str += f" (`{bitrate_mbps:.1f} Mbps`)"
+                            bitrate_mbps = (size_bytes * 8) / \
+                                (runtime_minutes*60) / 1e6
+                            size_str += f" (`{bitrate_mbps:.1f} Mbps`)"
 
                         embed.add_field(
                             name="💾 Size",
-                            value=bitrate_str,
+                            value=size_str,
                             inline=False
                         )
 
@@ -356,7 +375,7 @@ class RadarrManager(commands.Cog):
                         )'''
             except Exception as e:
                 logging.warning(f"Could not parse release info: {e}")
-                
+
         embed.set_footer(text="Radarr")
 
         await self.radarr_channel.send(embed=embed)
@@ -407,33 +426,35 @@ class RadarrManager(commands.Cog):
     # ============= COMANDOS =============
     @commands.command()
     async def add(self, ctx,
-                  title=commands.parameter(
+                  input_title=commands.parameter(
                       default=None, description="Movie title"),
-                  quality_profile: int = commands.parameter(default=9, description="Quality profile ID (default = 1080p Efficient)")):
+                  quality_profile_id: int = commands.parameter(default=9, description="Quality profile ID (default = 1080p Efficient)")):
 
         profiles = self.radarr_api.get_quality_profiles()
+        if profiles:
+            quality_profile = profiles[quality_profile_id-1] if 0 < quality_profile_id < len(
+                profiles)+1 else None
+            if not quality_profile:
+                await ctx.send(f"❌ No profile {quality_profile_id} found")
+                return
 
-        if not profiles or not profiles[quality_profile]:
-            await ctx.send(f"❌ No profile {quality_profile} found")
-            return
-
-        search = self.radarr_api.search_movie(title)
+        search = self.radarr_api.search_movie(input_title)
 
         if search:
             movie = search[0]
         else:
-            await ctx.send(f"❌ No movie {title} found")
+            await ctx.send(f"❌ No movie `{input_title}` found")
             return
         title = movie['title']
         year = movie['year']
         tmdb_id = movie['tmdbId']
 
-        # Verificar si existe
+        # Check if it already exists
         if any(p['tmdbId'] == tmdb_id for p in self.radarr_api.get_all_movies()):
             await ctx.send(f"`{title} ({year})` already exists")
             return
 
-        question = await ctx.send(f"Do you want to download the movie `{title} ({year})` in `{profiles[quality_profile-1]['name']}`?")
+        question = await ctx.send(f"Do you want to download the movie `{title} ({year})` in `{quality_profile['name']}`?")
         await question.add_reaction('✅')
         await question.add_reaction('❌')
 
@@ -444,11 +465,11 @@ class RadarrManager(commands.Cog):
 
             if str(reaction.emoji) == '✅':
                 self.radarr_api.add_movie(
-                    titulo=title,
+                    title=title,
                     year=year,
                     tmdb_id=tmdb_id,
-                    root_folder="/downloads/films/",
-                    quality_profile=quality_profile,
+                    root_folder=self.root_folder,
+                    quality_profile=quality_profile['id'],
                     search=True
                 )
 
@@ -474,6 +495,41 @@ class RadarrManager(commands.Cog):
 
         await ctx.send(msg)
 
+    @commands.command(name='letterboxd')
+    async def add_from_letterboxd_watchlist(self, ctx):
+        new_movies = self.letterboxd.watchlist_new_films()
+
+        for movie_title in new_movies[0:6]:
+            logging.info(movie_title)
+            search = await asyncio.to_thread(self.radarr_api.search_movie, movie_title)
+            if search:
+                movie = search[0]
+            else:
+                await ctx.send(f"❌ No movie `{movie_title}` found")
+                await asyncio.sleep(1)
+                continue
+
+            title = movie['title']
+            year = movie['year']
+            tmdb_id = movie['tmdbId']
+
+            # Check if it already exists
+            if any(p['tmdbId'] == tmdb_id for p in self.radarr_api.get_all_movies()):
+                await ctx.send(f"`{title} ({year})` already exists")
+                await asyncio.sleep(1)
+                continue
+
+            await asyncio.to_thread(self.radarr_api.add_movie,
+                                    title=title,
+                                    year=year,
+                                    tmdb_id=tmdb_id,
+                                    root_folder=self.root_folder,
+                                    quality_profile=13,
+                                    search=True
+                                    )
+            self.letterboxd.add_to_cache(movie_title)
+            await asyncio.sleep(1)
+
     @commands.command()
     async def status(self, ctx):
         """Status of queue"""
@@ -493,7 +549,7 @@ class RadarrManager(commands.Cog):
             all_movies = self.radarr_api.get_all_movies()
             downloaded = [m for m in all_movies if m.get('hasFile')]
             monitored = [m for m in all_movies if m.get('monitored')]
-            #missing = [m for m in monitored if not m.get('hasFile')]
+            # missing = [m for m in monitored if not m.get('hasFile')]
             queue_response = self.radarr_api.get_queue()
             if isinstance(queue_response, dict):
                 queue = queue_response.get('records', [])
@@ -502,12 +558,13 @@ class RadarrManager(commands.Cog):
             else:
                 queue = []
             downloading_movie_ids = [item.get('movieId') for item in queue]
-            missing = [m for m in monitored if not m.get('hasFile') and m['id'] not in downloading_movie_ids]
-            
+            missing = [m for m in monitored if not m.get(
+                'hasFile') and m['id'] not in downloading_movie_ids]
+
             # Calculate total size (in bytes)
             total_size_bytes = sum(m.get('sizeOnDisk', 0) for m in downloaded)
 
-            size_gb = round(total_size_bytes / (1024**3), 2)
+            size_gb = round(total_size_bytes / 1e9, 2)
 
             # Create embed
             embed = discord.Embed(
@@ -555,7 +612,7 @@ class RadarrManager(commands.Cog):
 
             # Currently downloading
             if queue:
-                downloading_list = ""   
+                downloading_list = ""
                 for i, item in enumerate(queue[:10], 1):
                     # ← Verificar que item es diccionario
                     if not isinstance(item, dict):
@@ -568,7 +625,8 @@ class RadarrManager(commands.Cog):
                     size = item.get('size', 1)
 
                     if size > 0:
-                        progress_percent = round(((size - sizeleft) / size) * 100, 1)
+                        progress_percent = round(
+                            ((size - sizeleft) / size) * 100, 1)
                     else:
                         progress_percent = 0
 
@@ -577,7 +635,6 @@ class RadarrManager(commands.Cog):
                     time_str = ""
                     if timeleft:
                         time_str = str(timeleft)
-
 
                     downloading_list += (
                         f"{i}. **{movie_title}**\n"
@@ -593,7 +650,7 @@ class RadarrManager(commands.Cog):
                     value=downloading_list,
                     inline=False
                 )
-            
+
             # Footer with timestamp
             since = min(all_movies, key=lambda x: x['added'])[
                 'added'][:10] if all_movies else "N/A"
