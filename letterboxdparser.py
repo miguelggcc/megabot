@@ -7,6 +7,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
+
 WATCHLIST_CACHE = "letterboxd_cache.json"
 
 
@@ -54,18 +55,15 @@ class LetterboxdParser(HTMLParser):
 
             matches = re.findall(
                 r'data-item-name="([^"]+\(\d{4}\))"', html_content)
-            print(len(matches))
             films = [html.unescape(p) for p in reversed(matches)]
             return films
 
         except Exception as e:
-            print(f"Error: {e}")
+            logging.error(f"Error in LetterboxdParser: {e}")
             return []
 
     def watchlist_new_films(self):
         watchlist = self.extract_watchlist()
         cache = self.load_cache()
-        print(cache)
         new_films = [p for p in watchlist if p not in cache]
-
         return new_films

@@ -1,4 +1,6 @@
-from discord.ext import commands
+import datetime
+
+from discord.ext import commands, tasks
 import discord
 import json
 import os
@@ -146,65 +148,21 @@ class RadarrAPI:
                     f"Movie '{found_movie['title']}' created successfully.")
 
 
-class PersistentQueue:
-
-    def __init__(self, queue_file='queue.json'):
-        self.queue_file = queue_file
-
-    def load(self):
-        if not os.path.exists(self.queue_file):
-            return []
-        try:
-            with open(self.queue_file) as f:
-                return json.load(f)
-        except:
-            return []
-
-    def save(self, queue):
-        with open(self.queue_file, 'w') as f:
-            json.dump(queue, f)
-
-    def add(self, file_path):
-        queue = self.load()
-        queue.append({
-            "file_path": file_path,
-            "timestamp": time.time(),
-            "status": "pending"
-        })
-        self.save(queue)
-
-    def get_pending(self):
-        return [item for item in self.load() if item['status'] == 'pending']
-
-    def mark_completed(self, file_path):
-        queue = self.load()
-        for item in queue:
-            if item['file_path'] == file_path:
-                item['status'] = 'completed'
-        self.save(queue)
-
-    def mark_error(self, file_path):
-        queue = self.load()
-        for item in queue:
-            if item['file_path'] == file_path:
-                item['status'] = 'error'
-        self.save(queue)
-
-
 class RadarrManager(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
 
         self.radarr_api = RadarrAPI()
-        self.queue = PersistentQueue()
         letterboxd_user = os.getenv("LETTERBOXD_USER")
+
         if letterboxd_user:
             self.letterboxd = LetterboxdParser(letterboxd_user)
 
         self.root_folder = os.getenv("DOWNLOADS_DIR")
 
         self.radarr_channel = None
+        self.default_quality_profile = 13
         self.events = {
             'Import': ('✅', 'Imported movie', 0x00ff00),
             'Grab': ('🔎', 'Grabbed movie', 0x5cffbd),
@@ -219,7 +177,8 @@ class RadarrManager(commands.Cog):
         self.webhook_runner = None
         self.webhook_site = None
 
-        # self.procesar_cola_task.start()
+        if letterboxd_user:
+            self.add_from_letterboxd_watchlist.start()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -305,7 +264,7 @@ class RadarrManager(commands.Cog):
                             inline=False
                         )
 
-                    # Size & Bitrate
+                    # Size and bitrate
                     size_bytes = release.get('size')
 
                     movie_id = movie.get("id")
@@ -382,54 +341,15 @@ class RadarrManager(commands.Cog):
         logging.info(f"Webhook: {event_type} - {movie_title}")
         return True
 
-    # ============= TASKS =============
-
-    '''@tasks.loop(seconds=30)
-    async def procesar_cola_task(self):
-        """Procesar cola cada 30 segundos"""
-        try:
-            pendientes = self.queue.get_pending()
-
-            if not pendientes:
-                return
-
-            logging.info(f"Procesando {len(pendientes)} archivo(s)...")
-
-            for item in pendientes:
-                file_path = item['file_path']
-                success, nombre = self.organizer.organize_file(file_path)
-
-                if success:
-                    self.queue.mark_completed(file_path)
-                    mensaje = f"✅ Importada: **{nombre}**"
-                else:
-                    self.queue.mark_error(file_path)
-                    mensaje = f"❌ Error: {os.path.basename(file_path)}"
-
-                if self.radarr_channel:
-                    await self.radarr_channel.send(mensaje)
-
-            self._notify_plex()
-
-        except Exception as e:
-            logging.error(f"Error: {e}")
-
-    def _notify_plex(self):
-        """Notificar a Plex"""
-        try:
-            url = f"{self.config['plex_url']}/library/sections/{self.config['plex_lib_id']}/refresh?X-Plex-Token={self.config['plex_token']}"
-            urllib.request.urlopen(url, timeout=10)
-            logging.info("Plex notificado")
-        except Exception as e:
-            logging.error(f"Error Plex: {e}")'''
-
-    # ============= COMANDOS =============
+    # ============= COMMANDS =============
     @commands.command()
     async def add(self, ctx,
                   input_title=commands.parameter(
                       default=None, description="Movie title"),
-                  quality_profile_id: int = commands.parameter(default=9, description="Quality profile ID (default = 1080p Efficient)")):
+                  quality_profile_id: int = commands.parameter(default=None, description="Quality profile ID")):
 
+        if not quality_profile_id:
+            quality_profile_id = self.default_quality_profile
         profiles = self.radarr_api.get_quality_profiles()
         if profiles:
             quality_profile = profiles[quality_profile_id-1] if 0 < quality_profile_id < len(
@@ -495,11 +415,18 @@ class RadarrManager(commands.Cog):
 
         await ctx.send(msg)
 
-    @commands.command(name='letterboxd')
+    def cog_unload(self):
+        self.add_from_letterboxd_watchlist.cancel()
+
+    @tasks.loop(time=datetime.time(hour=8, minute=30, tzinfo=datetime.timezone.utc))
     async def add_from_letterboxd_watchlist(self, ctx):
+
+        if not self.letterboxd:
+            return
+
         new_movies = self.letterboxd.watchlist_new_films()
 
-        for movie_title in new_movies[0:6]:
+        for movie_title in new_movies:
             logging.info(movie_title)
             search = await asyncio.to_thread(self.radarr_api.search_movie, movie_title)
             if search:
@@ -524,32 +451,83 @@ class RadarrManager(commands.Cog):
                                     year=year,
                                     tmdb_id=tmdb_id,
                                     root_folder=self.root_folder,
-                                    quality_profile=13,
+                                    quality_profile=self.default_quality_profile,
                                     search=True
                                     )
             self.letterboxd.add_to_cache(movie_title)
             await asyncio.sleep(1)
 
     @commands.command()
-    async def status(self, ctx):
-        """Status of queue"""
-        queue = self.queue.load()
-        pending = len([q for q in queue if q['status'] == 'pending'])
-        completed = len([q for q in queue if q['status'] == 'completed'])
-        errors = len([q for q in queue if q['status'] == 'error'])
+    async def downloads(self, ctx):
+        try:
+            embed = discord.Embed(
+                title="⬇️ Current downloads",
+                color=0x0099ff
+            )
+            queue_response = self.radarr_api.get_queue()
+            if isinstance(queue_response, dict):
+                queue = queue_response.get('records', [])
+            elif isinstance(queue_response, list):
+                queue = queue_response
+            else:
+                queue = []
 
-        msg = f"📋 **Queue:** {len(queue)} total | ⏳ {pending} pending | ✅ {completed} completed | ❌ {errors} errors"
-        await ctx.send(msg)
+                # Currently downloading
+            if queue:
+                downloading_list = ""
+                for i, item in enumerate(queue[:10], 1):
+                    # ← Verificar que item es diccionario
+                    if not isinstance(item, dict):
+                        continue
+
+                    movie_title = item.get('title', 'Unknown')
+
+                    # Progress
+                    sizeleft = item.get('sizeleft', 0)
+                    size = item.get('size', 1)
+
+                    if size > 0:
+                        progress_percent = round(
+                            ((size - sizeleft) / size) * 100, 1)
+                    else:
+                        progress_percent = 0
+
+                    # Timeleft
+                    timeleft = item.get('timeleft')
+
+                    time_str = f"`{str(timeleft)}`" if timeleft else "∞"
+                    if timeleft:
+                        movie_title = f"**{movie_title}**"
+                    downloading_list += (
+                        f"{i}. {movie_title}\n"
+                        f"   `{progress_percent}%` | "
+                        f"Time left: `{time_str}`\n"
+                    )
+
+                if len(queue) > 10:
+                    downloading_list += f"\n... and {len(queue) - 10} more"
+
+                embed.add_field(
+                    name="Downloading " + ("1 movie" if len(
+                        queue) == 1 else f"{len(queue)} movies"),
+                    value=downloading_list,
+                    inline=False
+                )
+                await ctx.send(embed=embed)
+
+        except Exception as e:
+            logging.error(f"Error in Radarr: {e}")
+            await ctx.send(f"❌ Error: {e}")
 
     @commands.command()
-    async def health(self, ctx):
-        """Radarr health status with size and downloading movies"""
+    async def status(self, ctx):
+        """Radarr status with size and downloading movies"""
         try:
 
             all_movies = self.radarr_api.get_all_movies()
             downloaded = [m for m in all_movies if m.get('hasFile')]
             monitored = [m for m in all_movies if m.get('monitored')]
-            # missing = [m for m in monitored if not m.get('hasFile')]
+
             queue_response = self.radarr_api.get_queue()
             if isinstance(queue_response, dict):
                 queue = queue_response.get('records', [])
@@ -610,47 +588,26 @@ class RadarrManager(commands.Cog):
                     inline=False
                 )
 
-            # Currently downloading
             if queue:
-                downloading_list = ""
-                for i, item in enumerate(queue[:10], 1):
-                    # ← Verificar que item es diccionario
-                    if not isinstance(item, dict):
-                        continue
-
-                    movie_title = item.get('title', 'Unknown')
-
-                    # Progress
-                    sizeleft = item.get('sizeleft', 0)
-                    size = item.get('size', 1)
-
-                    if size > 0:
-                        progress_percent = round(
-                            ((size - sizeleft) / size) * 100, 1)
-                    else:
-                        progress_percent = 0
-
-                    # Timeleft
-                    timeleft = item.get('timeleft')
-                    time_str = ""
-                    if timeleft:
-                        time_str = str(timeleft)
-
-                    downloading_list += (
-                        f"{i}. **{movie_title}**\n"
-                        f"   `{progress_percent}%` | "
-                        f"Time left: `{time_str}`\n"
-                    )
-
-                if len(queue) > 10:
-                    downloading_list += f"\n... and {len(queue) - 10} more"
-
                 embed.add_field(
-                    name=f"⬇️ Downloading ({len(queue)})",
-                    value=downloading_list,
+                    name=f"⬇️ Downloading",
+                    value="1 movie" if len(
+                        queue) == 1 else f"{len(queue)} movies",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"⬇️ Downloading",
+                    value="No active downloads",
                     inline=False
                 )
 
+            if self.add_from_letterboxd_watchlist.is_running():
+                embed.add_field(
+                    name=f"📽 Letterboxd watcher",
+                    value="Running",
+                    inline=False
+                )
             # Footer with timestamp
             since = min(all_movies, key=lambda x: x['added'])[
                 'added'][:10] if all_movies else "N/A"
