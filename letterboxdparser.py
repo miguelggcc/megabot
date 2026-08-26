@@ -17,7 +17,6 @@ class LetterboxdParser(HTMLParser):
     def __init__(self, user):
         super().__init__()
         self.user = user
-        self.peliculas = []
 
     def save_cache(self, films):
         with open(WATCHLIST_CACHE, 'w') as c:
@@ -55,7 +54,8 @@ class LetterboxdParser(HTMLParser):
 
             matches = re.findall(
                 r'data-item-name="([^"]+\(\d{4}\))"', html_content)
-            films = [html.unescape(p) for p in reversed(matches)]
+            
+            films = [html.unescape(m) for m in reversed(matches)]
             return films
 
         except Exception as e:
@@ -65,5 +65,5 @@ class LetterboxdParser(HTMLParser):
     def watchlist_new_films(self):
         watchlist = self.extract_watchlist()
         cache = self.load_cache()
-        new_films = [p for p in watchlist if p not in cache]
+        new_films = [f for f in watchlist if f not in cache]
         return new_films

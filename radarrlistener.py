@@ -177,9 +177,6 @@ class RadarrManager(commands.Cog):
         self.webhook_runner = None
         self.webhook_site = None
 
-        if letterboxd_user:
-            self.add_from_letterboxd_watchlist.start()
-
     @commands.Cog.listener()
     async def on_ready(self):
 
@@ -193,7 +190,8 @@ class RadarrManager(commands.Cog):
             logging.info("✅ RadarrManager ready!")
 
         await self._start_webhook_server()
-
+        if self.letterboxd and not self.add_from_letterboxd_watchlist.is_running():
+            self.add_from_letterboxd_watchlist.start()
     # ==========================================
 
     async def _start_webhook_server(self):
@@ -419,7 +417,7 @@ class RadarrManager(commands.Cog):
         self.add_from_letterboxd_watchlist.cancel()
 
     @tasks.loop(time=datetime.time(hour=8, minute=30, tzinfo=datetime.timezone.utc))
-    async def add_from_letterboxd_watchlist(self, ctx):
+    async def add_from_letterboxd_watchlist(self):
 
         if not self.letterboxd:
             return
@@ -432,7 +430,7 @@ class RadarrManager(commands.Cog):
             if search:
                 movie = search[0]
             else:
-                await ctx.send(f"❌ No movie `{movie_title}` found")
+                await self.radarr_channel.send(f"❌ No movie `{movie_title}` found")
                 await asyncio.sleep(1)
                 continue
 
@@ -441,19 +439,17 @@ class RadarrManager(commands.Cog):
             tmdb_id = movie['tmdbId']
 
             # Check if it already exists
-            if any(p['tmdbId'] == tmdb_id for p in self.radarr_api.get_all_movies()):
-                await ctx.send(f"`{title} ({year})` already exists")
-                await asyncio.sleep(1)
-                continue
-
-            await asyncio.to_thread(self.radarr_api.add_movie,
-                                    title=title,
-                                    year=year,
-                                    tmdb_id=tmdb_id,
-                                    root_folder=self.root_folder,
-                                    quality_profile=self.default_quality_profile,
-                                    search=True
-                                    )
+            if any(m['tmdbId'] == tmdb_id for m in self.radarr_api.get_all_movies()):
+                await self.radarr_channel.send(f"`{title} ({year})` already exists")
+            else:
+                await asyncio.to_thread(self.radarr_api.add_movie,
+                                        title=title,
+                                        year=year,
+                                        tmdb_id=tmdb_id,
+                                        root_folder=self.root_folder,
+                                        quality_profile=self.default_quality_profile,
+                                        search=True
+                                        )
             self.letterboxd.add_to_cache(movie_title)
             await asyncio.sleep(1)
 
