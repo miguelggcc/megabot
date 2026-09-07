@@ -277,7 +277,6 @@ class MegaBot(commands.Cog):
                 node = self.mega._api.getNodeByHandle(files[n]["handle"])
                 node = self.mega._api.authorizeNode(node)
                 self.bot.get_cog('RadarrManager').radarr_api.auto_import_radarr(dir+'/'+node.getName(), '/downloads/films')
-                return
                 self.mega.download(node, dir, self.bot.get_cog('RadarrManager').radarr_api)
                 # If this is the first download, start the status updates
                 if len(self.mega.current_dls) == 1:

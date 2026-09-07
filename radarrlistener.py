@@ -484,6 +484,7 @@ class RadarrManager(commands.Cog):
                     hour=int(hour), minute=int(minutes), tzinfo=datetime.timezone.utc
                 )
             )
+            self.add_from_letterboxd_watchlist.restart() 
             await ctx.send(f"⏰ Scan time changed to " + self.add_from_letterboxd_watchlist.time[0].isoformat())
 
     @commands.command()
@@ -502,7 +503,6 @@ class RadarrManager(commands.Cog):
             if queue:
                 downloading_list = ""
                 for i, item in enumerate(queue[:10], 1):
-                    # ← Verificar que item es diccionario
                     if not isinstance(item, dict):
                         continue
 
@@ -627,7 +627,7 @@ class RadarrManager(commands.Cog):
                 )
 
             if self.add_from_letterboxd_watchlist.is_running():
-                next_time = "Next scan at " + self.add_from_letterboxd_watchlist.time[0].isoformat() 
+                next_time = "Next scan at " + self.add_from_letterboxd_watchlist.next_iteration.isoformat()
                 embed.add_field(
                     name=f"📽 Letterboxd watcher", value=next_time, inline=False
                 )
