@@ -86,12 +86,12 @@ class RadarrAPI:
 
     def auto_import_radarr(self, file_path, save_to):
 
-        father_dir = os.path.dirname(file_path)
+        parent_dir = os.path.dirname(file_path)
         file_path = os.path.abspath(file_path)
 
-        # 1. Scan directory
+        # Scan directory
         res = self.request(
-            f"manualimport?folder={urllib.parse.quote(father_dir)}&filterExistingFiles=false"
+            f"manualimport?folder={urllib.parse.quote(parent_dir)}&filterExistingFiles=false"
         )
         files = next((r for r in res if r["path"] == file_path), None)
 
@@ -102,58 +102,97 @@ class RadarrAPI:
 
         # Movie already in the library
         if files.get("movie"):
-            logging.info(files["movie"])
-            movie_id = files["movie"]["id"]
+            logging.info(f"Movie already exists in library: {files['movie']['title']}")
+            '''files["rejections"] = [] 
+            files["importApproved"] = True
+            import_payload = [
+                                {
+                                    "files": [files],
+                                    "quality": files["quality"],
+                                    "importMode": "move",
+                                }
+                            ]
+
+            try:
+                self.request("manualimport", method="POST", data=import_payload)
+            except Exception as e:
+                logging.error(f"Error in webhook: {e}")
+                
+            logging.info(f"Existing movie imported successfully via Radarr API.")
+            return'''
+            radarr_movie_folder = files["movie"].get("path") # e.g., "/media/Movies/The Matrix (1999)"
+    
+            if radarr_movie_folder and os.path.exists(radarr_movie_folder):
+                file_name = os.path.basename(file_path)
+                name_part, ext_part = os.path.splitext(file_name)
+                
+                # 2. Append an edition tag to prevent overwriting your existing file
+                # This format ensures Plex / Jellyfin treats it as an additional version
+                new_file_name = f"{name_part} - WEB-DL{ext_part}"
+                final_destination       = os.path.join(radarr_movie_folder, new_file_name)
+                
+                try:
+                    logging.info(f"Bypassing Radarr API. Moving secondary version to: {final_destination}")
+                    shutil.move(file_path, final_destination)
+                    logging.info("Multi-version file safely imported via Python.")
+                    return
+                except Exception as e:
+                    logging.error(f"Failed to manually move file: {e}")
+                    return
+            else:
+                logging.error("Could not locate Radarr's target library directory to manually place file.")
+                
         else:
             # If not in library, search and create
             # os.path.basename(carpeta_padre)
             file_name = os.path.basename(file_path)
-            logging.info(f"Seraching info of '{file_name}' in Radarr...")
+            logging.info(f"Searching info of '{file_name}' in Radarr...")
             search = self.search_movie(file_name)
 
-            if search:
-                found_movie = search[0]
+            if not search:
+                logging.error(f"Could not find matching movie metadata for {file_name}")
+                return
+            
+            found_movie = search[0]
+            title = f"{found_movie['title']} ({found_movie['year']})"
+            target_dir = os.path.join(save_to, title)
+            logging.info(target_dir)
+            try:
+                if not os.path.exists(target_dir):
+                    os.makedirs(target_dir, exist_ok=True)
+                    logging.info(f"Directory created: {target_dir}")
+                else:
+                    logging.info(f"Directory already exists...")
+            except Exception as e:
+                logging.error(f"Error creating directory {target_dir}: {e}")
+            # If it already exists, move the content and delete directory once empty
+            for item in os.listdir(parent_dir):
+                shutil.move(os.path.join(parent_dir, item), target_dir)
 
-                title = f"{found_movie['title']} ({found_movie['year']})"
-                base_dir = os.path.dirname(os.path.normpath(file_path))
-                target_dir = os.path.join(save_to, title)
-                logging.info(target_dir)
-                try:
-                    if not os.path.exists(target_dir):
-                        os.makedirs(target_dir, exist_ok=True)
-                        logging.info(f"Directory created: {target_dir}")
-                    else:
-                        logging.info(f"Directory already exists...")
-                except Exception as e:
-                    logging.error(f"Error craeting directory {target_dir}: {e}")
-                # If it already exists, move the content and delete directory once empty
-                for item in os.listdir(father_dir):
-                    shutil.move(os.path.join(father_dir, item), target_dir)
+            new_movie = self.add_movie(
+                found_movie["title"],
+                found_movie["year"],
+                found_movie["tmdbId"],
+                save_to,
+            )
 
-                new_movie = self.add_movie(
-                    found_movie["title"],
-                    found_movie["year"],
-                    found_movie["tmdbId"],
-                    save_to,
-                )
+            movie_id = new_movie["id"]
+            new_path = os.path.join(target_dir, file_name)
 
-                movie_id = new_movie["id"]
-                new_path = os.path.join(target_dir, file_name)
-
-                # Import from the new path
-                if movie_id:
-                    import_payload = [
-                        {
-                            "path": new_path,  # <--- NEW PATH
-                            "movieId": movie_id,
-                            "quality": files["quality"],
-                            "importMode": "move",
-                        }
-                    ]
-                    self.request("manualimport", method="POST", data=import_payload)
-                    logging.info(f"Movie imported to Radarr from: {new_path}")
-
-                logging.info(f"Movie '{found_movie['title']}' created successfully.")
+            # Import from the new path
+            if movie_id:
+                import_payload = [
+                    {
+                        "path": new_path,  # <--- NEW PATH
+                        "movieId": movie_id,
+                        "quality": files["quality"],
+                        "importMode": "move",
+                    }
+                ]
+                self.request("manualimport", method="POST", data=import_payload)
+                logging.info(f"Movie imported to Radarr from: {new_path}")
+            else:
+                logging.error("Failed to add new movie entry to Radarr library.")
 
 
 class RadarrManager(commands.Cog):
@@ -444,10 +483,13 @@ class RadarrManager(commands.Cog):
         if not self.letterboxd:
             return
 
-        new_movies = self.letterboxd.watchlist_new_films()
+        logging.info(f"Doing scan of {self.letterboxd.user}'s watchlist")
+        new_movies = await asyncio.to_thread(self.letterboxd.watchlist_new_films)
 
+        if not new_movies: logging.info("No new movies found in watchlist")
+        
         for movie_title in new_movies:
-            logging.info(movie_title)
+            logging.info(f"New movie in watchlist: '{movie_title}'")
             search = await asyncio.to_thread(self.radarr_api.search_movie, movie_title)
             if search:
                 movie = search[0]
