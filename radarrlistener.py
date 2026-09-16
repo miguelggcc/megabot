@@ -484,8 +484,11 @@ class RadarrManager(commands.Cog):
             return
 
         logging.info(f"Doing scan of {self.letterboxd.user}'s watchlist")
-        new_movies = await asyncio.to_thread(self.letterboxd.watchlist_new_films)
-
+        new_movies =  await self.letterboxd.watchlist_new_films()
+        if new_movies is None:
+            logging.error(f"Can't connect to Letterboxd")
+            await self.radarr_channel.send(f"Can't connect to Letterboxd")
+            return
         if not new_movies: logging.info("No new movies found in watchlist")
         
         for movie_title in new_movies:

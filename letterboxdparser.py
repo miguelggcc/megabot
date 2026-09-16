@@ -1,3 +1,4 @@
+import asyncio
 import urllib.request
 import json
 import re
@@ -37,7 +38,7 @@ class LetterboxdParser(HTMLParser):
         except Exception as e:
             logging.error(f"Error in LetterboxdParser: {e}")
 
-    def extract_watchlist(self):
+    async def extract_watchlist(self, tries = 3):
         """Extract films from letterbooxd watchlist"""
 
         url = f"https://letterboxd.com/{self.user}/watchlist/"
@@ -46,24 +47,29 @@ class LetterboxdParser(HTMLParser):
             'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://letterboxd.com/'
         }
-
-        try:
+        def fetch_data():
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=15) as response:
-                html_content = response.read().decode('utf-8')
+                return response.read().decode('utf-8')
 
-            matches = re.findall(
-                r'data-item-name="([^"]+\(\d{4}\))"', html_content)
-            
-            films = [html.unescape(m) for m in reversed(matches)]
-            return films
+        for _ in range(tries):
+            try:
+                html_content = await asyncio.to_thread(fetch_data)
 
-        except Exception as e:
-            logging.error(f"Error in LetterboxdParser: {e}")
-            return []
+                matches = re.findall(
+                    r'data-item-name="([^"]+\(\d{4}\))"', html_content)
+                
+                films = [html.unescape(m) for m in reversed(matches)]
+                return films
 
-    def watchlist_new_films(self):
-        watchlist = self.extract_watchlist()
+            except Exception as e:
+                logging.error(f"Error in LetterboxdParser: {e}")
+                await asyncio.sleep(300)
+        return None
+
+    async def watchlist_new_films(self):
+        watchlist = await self.extract_watchlist()
+        if watchlist is None: return None
         cache = self.load_cache()
         new_films = [f for f in watchlist if f not in cache]
         return new_films
